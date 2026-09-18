@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>RustIOT 调试面板</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+            background: #0f172a; color: #e2e8f0;
+            min-height: 100vh; padding: 24px;
+        }
+        h1 { font-size: 20px; margin-bottom: 16px; color: #38bdf8; }
+        .status {
+            display: inline-block; padding: 4px 12px; border-radius: 999px;
+            font-size: 12px; margin-left: 8px;
+        }
+        .status.ok { background: #065f46; color: #6ee7b7; }
+        .status.off { background: #7f1d1d; color: #fca5a5; }
+
+        .grid {
+            display: grid; gap: 16px;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            margin-top: 16px;
+        }
+        .card {
+            background: #1e293b; border-radius: 12px; padding: 16px;
+            border: 1px solid #334155;
+        }
+        .card h3 { font-size: 14px; color: #94a3b8; margin-bottom: 8px; }
+        .card .value { font-size: 28px; font-weight: 700; color: #fbbf24; font-variant-numeric: tabular-nums; }
+        .card .meta { font-size: 11px; color: #64748b; margin-top: 6px; }
+
+        .panel { margin-top: 24px; background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+        .panel h2 { font-size: 16px; color: #38bdf8; margin-bottom: 12px; }
+
+        input, select, button {
+            background: #0f172a; color: #e2e8f0; border: 1px solid #475569;
+            border-radius: 6px; padding: 8px 12px; font-size: 14px;
+        }
+        button { background: #0369a1; border-color: #0369a1; cursor: pointer; font-weight: 600; }
+        button:hover { background: #0284c7; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+        .form-row label { font-size: 13px; color: #94a3b8; min-width: 80px; }
+
+        .log-box {
+            background: #020617; border-radius: 8px; padding: 12px; height: 200px;
+            overflow-y: auto; font-family: "Consolas", monospace; font-size: 12px;
+            border: 1px solid #334155;
+        }
+        .log-box .line { padding: 2px 0; border-bottom: 1px dashed #1e293b; }
+        .log-box .line:last-child { border-bottom: none; }
+    </style>
+</head>
+<body>
+
+<h1>🔧 RustIOT 边缘网关调试面板 <span id="ws-status" class="status off">● 未连接</span></h1>
+
+<div class="grid" id="cards">
+    <div class="card"><h3>等待数据…</h3><div class="value" style="color:#64748b">—</div></div>
+</div>
+
+<div class="panel">
+    <h2>📝 Modbus 写入</h2>
+    <div class="form-row">
+        <label>点位</label>
+        <select id="write-mapping">
+            <option value="temperature">temperature</option>
+            <option value="pressure">pressure</option>
+        </select>
+    </div>
+    <div class="form-row">
+        <label>从站地址</label>
+        <input type="number" id="write-slave" value="1" min="0" max="255" style="width:80px">
+        <label>起始地址</label>
+        <input type="number" id="write-addr" value="0" min="0" max="65535" style="width:100px">
+        <label>值(十进制, 逗号分隔)</label>
+        <input type="text" id="write-vals" value="0" style="width:200px">
+        <button id="write-btn">发送写入</button>
+    </div>
+</div>
+
+<div class="panel">
+    <h2>📡 实时日志</h2>
+    <div class="log-box" id="log"></div>
+</div>
+
+<script>
+    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8080';
+    let ws, reconnectTimer;
+    const latest = new Map(); // mapping -> card element
+
+    function connect() {
+        ws = new WebSocket(wsUrl);
+        const status = document.getElementById('ws-status');
+
+        ws.onopen = () => {
+            status.textContent = '● 已连接';
+            status.className = 'status ok';
+            log(`WebSocket 已连接 ${wsUrl}`);
+        };
+
+        ws.onclose = () => {
+            status.textContent = '● 未连接';
+            status.className = 'status off';
+            log('WebSocket 断开，3秒后重连…');
+            clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connect, 3000);
+        };
+
+        ws.onerror = () => log('WebSocket 错误');
+
+        ws.onmessage = (ev) => {
+            try {
+                const msg = JSON.parse(ev.data);
+                handleMessage(msg);
+            } catch (e) {
+                log('解析失败: ' + ev.data);
+            }
+        };
+    }
+
+    function handleMessage(msg) {
+        // 兼容 BridgeMessage 和 WsDataFrame 两种格式
+        let mapping, registers, timestampMs;
+
+        if (msg.kind === 'data') {
+            mapping = msg.mapping;
+            registers = msg.registers;
+            timestampMs = msg.timestamp_ms;
+        } else if (msg.ModbusReadResult) {
+            const r = msg.ModbusReadResult;
+            mapping = r.mapping_name;
+            registers = r.value?.registers || [];
+            timestampMs = r.timestamp_ms;
+        } else if (typeof msg === 'string') {
+            log(msg);
+            return;
+        } else {
+            log('未识别消息: ' + JSON.stringify(msg));
+            return;
+        }
+
+        updateCard(mapping, registers, timestampMs);
+    }
+
+    function updateCard(name, registers, ts) {
+        const container = document.getElementById('cards');
+        let card = latest.get(name);
+        if (!card) {
+            card = document.createElement('div');
+            card.className = 'card';
+            card.innerHTML = `<h3></h3><div class="value"></div><div class="meta"></div>`;
+            container.appendChild(card);
+            latest.set(name, card);
+        }
+        const display = registers.map(v =>
+            `${v} (0x${v.toString(16).padStart(4,'0')})`
+        ).join(', ') || '(空)';
+        card.querySelector('h3').textContent = name;
+        card.querySelector('.value').textContent = display;
+        card.querySelector('.meta').textContent =
+            `时间: ${new Date(ts).toLocaleTimeString()} | 原始: [${registers.join(', ')}]`;
+    }
+
+    function log(text) {
+        const box = document.getElementById('log');
+        const div = document.createElement('div');
+        div.className = 'line';
+        div.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+        while (box.children.length > 200) box.removeChild(box.firstChild);
+    }
+
+    document.getElementById('write-btn').onclick = () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) { alert('WebSocket 未连接'); return; }
+        const mapping = document.getElementById('write-mapping').value;
+        const slave = parseInt(document.getElementById('write-slave').value);
+        const addr = parseInt(document.getElementById('write-addr').value);
+        const vals = document.getElementById('write-vals').value
+            .split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+        const payload = {
+            ModbusWriteRequest: {
+                mapping_name: mapping, slave, address: addr, registers: vals
+            }
+        };
+        ws.send(JSON.stringify(payload));
+        log('发送写入: ' + JSON.stringify(payload));
+    };
+
+    connect();
+</script>
+</body>
+</html>

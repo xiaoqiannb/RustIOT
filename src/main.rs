@@ -20,6 +20,7 @@ mod modbus_client;
 mod mqtt_client;
 mod protocol;
 mod ws_server;
+mod web_server;
 
 use anyhow::Result;
 use tokio::sync::broadcast;
